@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 import logging
-from typing import Union
+from typing import Union, Optional, List
+from uuid import UUID
 
 import requests
 
-from pyplayready import InvalidLicense
+from pyplayready import InvalidXmrLicense
 from pyplayready.cdm import Cdm
 from pyplayready.device import Device
 from pyplayready.license.key import Key
-
-from pyplayready.exceptions import (DeviceMismatch, InvalidInitData)
+from pyplayready.misc.exceptions import (DeviceMismatch, InvalidInitData)
 from pyplayready.system.wrmheader import WRMHeader
 
 
@@ -95,19 +95,22 @@ class RemoteCdm(Cdm):
         if response.status_code != 200:
             raise ValueError(f"Cannot Close CDM Session, {response_json['message']} [{response.status_code}]")
 
-    def get_license_challenge(self, session_id: bytes, wrm_header: Union[WRMHeader, str]) -> str:
+    def get_license_challenge(self, session_id: bytes, wrm_header: Union[WRMHeader, str], rev_lists: Optional[List[UUID]]=None) -> str:
         if not wrm_header:
             raise InvalidInitData("A wrm_header must be provided.")
         if isinstance(wrm_header, WRMHeader):
             wrm_header = wrm_header.dumps()
         if not isinstance(wrm_header, str):
             raise ValueError(f"Expected WRMHeader to be a {str} or {WRMHeader} not {wrm_header!r}")
+        if rev_lists and not isinstance(rev_lists, list):
+            raise ValueError(f"Expected rev_lists to be a {list} not {rev_lists!r}")
 
         response = self.__session.post(
             url=f"{self.host}/{self.device_name}/get_license_challenge",
             json={
                 "session_id": session_id.hex(),
-                "init_data": wrm_header
+                "init_data": wrm_header,
+                **({"rev_lists": list(map(str, rev_lists))} if rev_lists else {})
             }
         )
         response_json = response.json()
@@ -119,10 +122,10 @@ class RemoteCdm(Cdm):
 
     def parse_license(self, session_id: bytes, license_message: str) -> None:
         if not license_message:
-            raise InvalidLicense("Cannot parse an empty license_message")
+            raise InvalidXmrLicense("Cannot parse an empty license_message")
 
         if not isinstance(license_message, str):
-            raise InvalidLicense(f"Expected license_message to be a {str}, not {license_message!r}")
+            raise InvalidXmrLicense(f"Expected license_message to be a {str}, not {license_message!r}")
 
         response = self.__session.post(
             url=f"{self.host}/{self.device_name}/parse_license",
@@ -158,6 +161,3 @@ class RemoteCdm(Cdm):
             )
             for key in response_json["data"]["keys"]
         ]
-
-
-__all__ = ("RemoteCdm",)

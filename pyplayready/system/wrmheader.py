@@ -1,26 +1,65 @@
 import base64
+import hashlib
 from enum import Enum
-from typing import Optional, List, Union, Tuple
+from typing import List, Optional, Union
+from uuid import UUID
+import xml.etree.ElementTree as ET
 
-import xmltodict
+from Crypto.Cipher import AES
+
+from pyplayready.misc.exceptions import InvalidWrmHeader, InvalidChecksum
+from pyplayready.system.util import Util
 
 
 class WRMHeader:
     """Represents a PlayReady WRM Header"""
 
     class SignedKeyID:
-        def __init__(
-                self,
-                alg_id: str,
-                value: str,
-                checksum: str
-        ):
-            self.alg_id = alg_id
+        class AlgId(Enum):
+            AESCTR = "AESCTR"
+            AESCBC = "AESCBC"
+            COCKTAIL = "COCKTAIL"
+            UNKNOWN = "UNKNOWN"
+
+            @classmethod
+            def _missing_(cls, value):
+                return cls.UNKNOWN
+
+        def __init__(self, value: UUID, alg_id, checksum: Optional[bytes]):
             self.value = value
+            self.alg_id = alg_id
             self.checksum = checksum
 
+        @classmethod
+        def load(cls, value: str, alg_id: str, checksum: Optional[str]):
+            return cls(
+                value=UUID(bytes_le=base64.b64decode(value)),
+                alg_id=cls.AlgId(alg_id),
+                checksum=base64.b64decode(checksum) if checksum else None
+            )
+
         def __repr__(self):
-            return f'SignedKeyID(alg_id={self.alg_id}, value="{self.value}", checksum="{self.checksum}")'
+            return f'SignedKeyID(value="{self.value}", alg_id={self.alg_id}, checksum={self.checksum})'
+
+        def verify(self, content_key: bytes) -> bool:
+            if self.value is None:
+                raise InvalidChecksum("Key ID must not be empty")
+            if self.checksum is None:
+                raise InvalidChecksum("Checksum must not be empty")
+
+            if self.alg_id == self.AlgId.AESCTR:
+                cipher = AES.new(content_key, mode=AES.MODE_ECB)
+                encrypted = cipher.encrypt(self.value.bytes_le)
+                checksum = encrypted[:8]
+            elif self.alg_id == self.AlgId.COCKTAIL:
+                buffer = content_key.ljust(21, b"\x00")
+                for _ in range(5):
+                    buffer = hashlib.sha1(buffer).digest()
+                checksum = buffer[:7]
+            else:
+                raise InvalidChecksum("Algorithm ID must be either \"AESCTR\" or \"COCKTAIL\"")
+
+            return checksum == self.checksum
 
     class Version(Enum):
         VERSION_4_0_0_0 = "4.0.0.0"
@@ -33,13 +72,9 @@ class WRMHeader:
         def _missing_(cls, value):
             return cls.UNKNOWN
 
-    _RETURN_STRUCTURE = Tuple[List[SignedKeyID], Optional[str], Optional[str], Optional[str]]
-
     def __init__(self, data: Union[str, bytes]):
-        """Load a WRM Header from either a string, base64 encoded data or bytes"""
-
         if not data:
-            raise ValueError("Data must not be empty")
+            raise InvalidWrmHeader("Data must not be empty")
 
         if isinstance(data, str):
             try:
@@ -47,99 +82,105 @@ class WRMHeader:
             except Exception:
                 data = data.encode("utf-16-le")
 
-        self._raw_data: bytes = data
-        self._parsed = xmltodict.parse(self._raw_data)
+        self._raw_data = data
+        self._root = ET.fromstring(data)
+        Util.remove_namespaces(self._root)
 
-        self._header = self._parsed.get('WRMHEADER')
-        if not self._header:
-            raise ValueError("Data is not a valid WRMHEADER")
+        if self._root.tag != "WRMHEADER":
+            raise InvalidWrmHeader("Data is not a valid WRMHEADER")
 
-        self.version = self.Version(self._header.get('@version'))
+        self.version = self.Version(self._root.attrib.get("version"))
 
-    @staticmethod
-    def _ensure_list(element: Union[dict, list]) -> List:
-        if isinstance(element, dict):
-            return [element]
-        return element
-
-    @staticmethod
-    def _read_v4_0_0_0(data: dict) -> _RETURN_STRUCTURE:
-        protect_info = data.get("PROTECTINFO")
-
-        return (
-            [WRMHeader.SignedKeyID(
-                alg_id=protect_info["ALGID"],
-                value=data["KID"],
-                checksum=data.get("CHECKSUM")
-            )],
-            data.get("LA_URL"),
-            data.get("LUI_URL"),
-            data.get("DS_ID")
-        )
-
-    @staticmethod
-    def _read_v4_1_0_0(data: dict) -> _RETURN_STRUCTURE:
-        protect_info = data.get("PROTECTINFO")
-
-        key_ids = []
-        if protect_info:
-            kid = protect_info["KID"]
-            if kid:
-                key_ids = [WRMHeader.SignedKeyID(
-                    alg_id=kid["@ALGID"],
-                    value=kid["@VALUE"],
-                    checksum=kid.get("@CHECKSUM")
-                )]
-
-        return key_ids, data.get("LA_URL"), data.get("LUI_URL"), data.get("DS_ID")
-
-    @staticmethod
-    def _read_v4_2_0_0(data: dict) -> _RETURN_STRUCTURE:
-        protect_info = data.get("PROTECTINFO")
-
-        key_ids = []
-        if protect_info:
-            kids = protect_info["KIDS"]
-            if kids:
-                for kid in WRMHeader._ensure_list(kids["KID"]):
-                    key_ids.append(WRMHeader.SignedKeyID(
-                        alg_id=kid["@ALGID"],
-                        value=kid["@VALUE"],
-                        checksum=kid.get("@CHECKSUM")
-                    ))
-
-        return key_ids, data.get("LA_URL"), data.get("LUI_URL"), data.get("DS_ID")
-
-    @staticmethod
-    def _read_v4_3_0_0(data: dict) -> _RETURN_STRUCTURE:
-        protect_info = data.get("PROTECTINFO")
-
-        key_ids = []
-        if protect_info:
-            kids = protect_info["KIDS"]
-            for kid in WRMHeader._ensure_list(kids["KID"]):
-                key_ids.append(WRMHeader.SignedKeyID(
-                    alg_id=kid.get("@ALGID"),
-                    value=kid["@VALUE"],
-                    checksum=kid.get("@CHECKSUM")
-                ))
-
-        return key_ids, data.get("LA_URL"), data.get("LUI_URL"), data.get("DS_ID")
-
-    def read_attributes(self) -> _RETURN_STRUCTURE:
-        """Read any non-custom XML attributes"""
-        data = self._header.get("DATA")
-        if not data:
-            raise ValueError("Not a valid PlayReady Header Record, WRMHEADER/DATA required")
+        self.key_ids: List[WRMHeader.SignedKeyID] = []
+        self.la_url: Optional[str] = None
+        self.lui_url: Optional[str] = None
+        self.ds_id: Optional[str] = None
+        self.custom_attributes: Optional[ET.Element] = None
+        self.decryptor_setup: Optional[str] = None
 
         if self.version == self.Version.VERSION_4_0_0_0:
-            return self._read_v4_0_0_0(data)
+            self._load_v4_0_data(self._root)
         elif self.version == self.Version.VERSION_4_1_0_0:
-            return self._read_v4_1_0_0(data)
+            self._load_v4_1_data(self._root)
         elif self.version == self.Version.VERSION_4_2_0_0:
-            return self._read_v4_2_0_0(data)
+            self._load_v4_2_data(self._root)
         elif self.version == self.Version.VERSION_4_3_0_0:
-            return self._read_v4_3_0_0(data)
+            self._load_v4_3_data(self._root)
+
+    def __repr__(self):
+        attrs = ", \n          ".join(f"{k}={v!r}" for k, v in self.__dict__.items())
+        return f"{self.__class__.__name__}({attrs})"
+
+    @staticmethod
+    def _attr(element, name):
+        return element.attrib.get(name) if element is not None else None
+
+    def _load_v4_0_data(self, parent: ET.Element):
+        Data = parent.find("DATA")
+
+        Kid = Data.findtext("KID")
+        AlgId = Data.findtext("PROTECTINFO/ALGID")
+        Checksum = Data.findtext("CHECKSUM")
+
+        self.key_ids = [self.SignedKeyID.load(Kid, AlgId, Checksum)]
+
+        self.la_url = Data.findtext("LA_URL")
+        self.lui_url = Data.findtext("LUI_URL")
+        self.ds_id = Data.findtext("DS_ID")
+
+        self.custom_attributes = Data.find("CUSTOMATTRIBUTES")
+
+    def _load_v4_1_data(self, parent: ET.Element):
+        Data = parent.find("DATA")
+
+        Kid = Data.find("PROTECTINFO/KID")
+        if Kid is not None:
+            Value = Kid.get("VALUE")
+            AlgId = Kid.get("ALGID")
+            Checksum = Kid.get("CHECKSUM")
+
+            self.key_ids.append(self.SignedKeyID.load(Value, AlgId, Checksum))
+
+        self.la_url = Data.findtext("LA_URL")
+        self.lui_url = Data.findtext("LUI_URL")
+        self.ds_id = Data.findtext("DS_ID")
+
+        self.custom_attributes = Data.find("CUSTOMATTRIBUTES")
+        self.decryptor_setup = Data.findtext("DECRYPTORSETUP")
+
+    def _load_v4_2_data(self, parent: ET.Element):
+        Data = parent.find("DATA")
+
+        for kid in Data.findall("PROTECTINFO/KIDS/KID"):
+            Value = kid.get("VALUE")
+            AlgId = kid.get("ALGID")
+            Checksum = kid.get("CHECKSUM")
+
+            self.key_ids.append(self.SignedKeyID.load(Value, AlgId, Checksum))
+
+        self.la_url = Data.findtext("LA_URL")
+        self.lui_url = Data.findtext("LUI_URL")
+        self.ds_id = Data.findtext("DS_ID")
+
+        self.custom_attributes = Data.find("CUSTOMATTRIBUTES")
+        self.decryptor_setup = Data.findtext("DECRYPTORSETUP")
+
+    def _load_v4_3_data(self, parent: ET.Element):
+        Data = parent.find("DATA")
+
+        for kid in Data.findall("PROTECTINFO/KIDS/KID"):
+            Value = kid.get("VALUE")
+            AlgId = kid.get("ALGID")
+            Checksum = kid.get("CHECKSUM")
+
+            self.key_ids.append(self.SignedKeyID.load(Value, AlgId, Checksum))
+
+        self.la_url = Data.findtext("LA_URL")
+        self.lui_url = Data.findtext("LUI_URL")
+        self.ds_id = Data.findtext("DS_ID")
+
+        self.custom_attributes = Data.find("CUSTOMATTRIBUTES")
+        self.decryptor_setup = Data.findtext("DECRYPTORSETUP")
 
     def dumps(self) -> str:
         return self._raw_data.decode("utf-16-le")

@@ -49,11 +49,6 @@ class Key:
 
     @staticmethod
     def kid_to_uuid(kid: Union[str, bytes]) -> UUID:
-        """
-        Convert a Key ID from a string or bytes to a UUID object.
-        At first, this may seem very simple, but some types of Key IDs
-        may not be 16 bytes and some may be decimal vs. hex.
-        """
         if isinstance(kid, str):
             kid = base64.b64decode(kid)
         if not kid:

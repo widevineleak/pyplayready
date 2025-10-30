@@ -7,25 +7,17 @@ import secrets
 class ElGamal:
     """ElGamal ECC utility using ecpy"""
 
-    def __init__(self, curve: Curve):
-        """Initialize the utility with a given curve type ('secp256r1' for PlayReady)"""
-        self.curve = curve
+    curve = Curve.get_curve("secp256r1")
 
     @staticmethod
-    def to_bytes(n: int) -> bytes:
-        byte_len = (n.bit_length() + 7) // 8
-        if byte_len % 2 != 0:
-            byte_len += 1
-        return n.to_bytes(byte_len, 'big')
-
-    def encrypt(self, message_point: Point, public_key: Point) -> Tuple[Point, Point]:
+    def encrypt(message_point: Point, public_key: Point) -> Tuple[Point, Point]:
         """
         Encrypt a single point with a given public key
 
         Returns an encrypted point pair
         """
-        ephemeral_key = secrets.randbelow(self.curve.order)
-        point1 = ephemeral_key * self.curve.generator
+        ephemeral_key = secrets.randbelow(ElGamal.curve.order)
+        point1 = ephemeral_key * ElGamal.curve.generator
         point2 = message_point + (ephemeral_key * public_key)
         return point1, point2
 

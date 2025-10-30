@@ -9,6 +9,8 @@ from Crypto.PublicKey import ECC
 from Crypto.PublicKey.ECC import EccKey
 from ecpy.curves import Curve, Point
 
+from pyplayready.system.util import Util
+
 
 class ECCKey:
     """Represents a PlayReady ECC key pair"""
@@ -29,7 +31,7 @@ class ECCKey:
         if not isinstance(private_key, int):
             raise ValueError(f"Expecting Bytes or Int input, got {private_key!r}")
 
-        # The public is always derived from the private key; loading the other stuff won't work
+        # The public key is always derived from the private key; loading the other stuff won't work
         key = ECC.construct(
             curve='P-256',
             d=private_key,
@@ -68,18 +70,11 @@ class ECCKey:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(self.dumps(private_only))
 
-    @staticmethod
-    def _to_bytes(n: int) -> bytes:
-        byte_len = (n.bit_length() + 7) // 8
-        if byte_len % 2 != 0:
-            byte_len += 1
-        return n.to_bytes(byte_len, 'big')
-
     def get_point(self, curve: Curve) -> Point:
         return Point(self.key.pointQ.x, self.key.pointQ.y, curve)
 
     def private_bytes(self) -> bytes:
-        return self._to_bytes(int(self.key.d))
+        return Util.to_bytes(int(self.key.d))
 
     def private_sha256_digest(self) -> bytes:
         hash_object = SHA256.new()
@@ -87,7 +82,7 @@ class ECCKey:
         return hash_object.digest()
 
     def public_bytes(self) -> bytes:
-        return self._to_bytes(int(self.key.pointQ.x)) + self._to_bytes(int(self.key.pointQ.y))
+        return Util.to_bytes(int(self.key.pointQ.x)) + Util.to_bytes(int(self.key.pointQ.y))
 
     def public_sha256_digest(self) -> bytes:
         hash_object = SHA256.new()

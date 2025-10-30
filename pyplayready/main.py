@@ -7,12 +7,15 @@ import click
 import requests
 from Crypto.Random import get_random_bytes
 
-from pyplayready import __version__, InvalidCertificateChain, InvalidLicense
-from pyplayready.system.bcert import CertificateChain, Certificate
+from pyplayready import __version__, InvalidCertificateChain, InvalidXmrLicense
 from pyplayready.cdm import Cdm
-from pyplayready.device import Device
 from pyplayready.crypto.ecc_key import ECCKey
-from pyplayready.exceptions import OutdatedDevice
+from pyplayready.crypto.key_wrap import unwrap_wrapped_key
+from pyplayready.device import Device
+from pyplayready.misc.exceptions import OutdatedDevice
+from pyplayready.misc.revocation_list import RevocationList
+from pyplayready.system.bcert import CertificateChain, Certificate, BCertCertType, BCertObjType, BCertFeatures, \
+    BCertKeyType, BCertKeyUsage
 from pyplayready.system.pssh import PSSH
 
 
@@ -56,7 +59,7 @@ def license_(device_path: Path, pssh: PSSH, server: str) -> None:
     session_id = cdm.open()
     log.info("Opened Session")
 
-    challenge = cdm.get_license_challenge(session_id, pssh.wrm_headers[0])
+    challenge = cdm.get_license_challenge(session_id, pssh.wrm_headers[0], rev_lists=RevocationList.SupportedListIds)
     log.info("Created License Request (Challenge)")
     log.debug(challenge)
 
@@ -68,12 +71,16 @@ def license_(device_path: Path, pssh: PSSH, server: str) -> None:
         data=challenge
     )
 
+    if license_response.status_code != 200:
+        log.error("Failed to send Challenge: [%s] %s", license_response.status_code, license_response.text)
+        return
+
     licence = license_response.text
     log.debug(licence)
 
     try:
         cdm.parse_license(session_id, licence)
-    except InvalidLicense as e:
+    except InvalidXmrLicense as e:
         log.error(e)
         return
 
@@ -94,7 +101,8 @@ def license_(device_path: Path, pssh: PSSH, server: str) -> None:
 def test(ctx: click.Context, device: Path, ckt: str, security_level: str) -> None:
     """
     Test the CDM code by getting Content Keys for the Tears Of Steel demo on the Playready Test Server.
-    https://testweb.playready.microsoft.com/Content/Content2X
+    https://learn.microsoft.com/en-us/playready/advanced/testcontent/playready-2x-test-content#tears-of-steel---4k-content
+
     + DASH Manifest URL: https://test.playready.microsoft.com/media/profficialsite/tearsofsteel_4k.ism/manifest.mpd
     + MSS Manifest URL: https://test.playready.microsoft.com/media/profficialsite/tearsofsteel_4k.ism.smoothstreaming/manifest
 
@@ -126,36 +134,61 @@ def test(ctx: click.Context, device: Path, ckt: str, security_level: str) -> Non
 
 
 @main.command()
-@click.option("-k", "--group_key", type=Path, required=True, help="Device ECC private group key")
-@click.option("-e", "--encryption_key", type=Path, required=False, help="Optional Device ECC private encryption key")
-@click.option("-s", "--signing_key", type=Path, required=False, help="Optional Device ECC private signing key")
-@click.option("-c", "--group_certificate", type=Path, required=True, help="Device group certificate chain")
+@click.option("-k", "--group_key", type=Path, help="Device ECC private group key (zgpriv.dat)")
+@click.option("-pk", "--protected_group_key", type=Path, help="Protected Device ECC private group key (zgpriv_protected.dat)")
+@click.option("-e", "--encryption_key", type=Path, help="Optional Device ECC private encryption key (zprivencr.dat)")
+@click.option("-s", "--signing_key", type=Path, help="Optional Device ECC private signing key (zprivsig.dat)")
+@click.option("-c", "--group_certificate", type=Path, required=True, help="Device group certificate chain (bgroupcert.dat)")
 @click.option("-o", "--output", type=Path, default=None, help="Output Path or Directory")
 @click.pass_context
 def create_device(
     ctx: click.Context,
     group_key: Path,
+    protected_group_key: Path,
     encryption_key: Optional[Path],
     signing_key: Optional[Path],
     group_certificate: Path,
     output: Optional[Path] = None
 ) -> None:
     """Create a Playready Device (.prd) file from an ECC private group key and group certificate chain"""
-    if not group_key.is_file():
-        raise click.UsageError("group_key: Not a path to a file, or it doesn't exist.", ctx)
+    if bool(group_key) == bool(protected_group_key):
+        raise click.UsageError("You must provide exactly one of group_key or protected_group_key.", ctx)
     if not group_certificate.is_file():
         raise click.UsageError("group_certificate: Not a path to a file, or it doesn't exist.", ctx)
 
     log = logging.getLogger("create-device")
 
-    encryption_key = ECCKey.load(encryption_key) if encryption_key else ECCKey.generate()
-    signing_key = ECCKey.load(signing_key) if signing_key else ECCKey.generate()
+    if group_key:
+        if not group_key.is_file():
+            raise click.UsageError("group_key: Not a path to a file, or it doesn't exist.", ctx)
 
-    group_key = ECCKey.load(group_key)
+        group_key = ECCKey.load(group_key)
+    elif protected_group_key:
+        if not protected_group_key.is_file():
+            raise click.UsageError("protected_group_key: Not a path to a file, or it doesn't exist.", ctx)
+
+        wrapped_key = protected_group_key.read_bytes()
+        unwrapped_key = unwrap_wrapped_key(wrapped_key)
+        group_key = ECCKey.loads(unwrapped_key)
+
     certificate_chain = CertificateChain.load(group_certificate)
 
-    if certificate_chain.get(0).get_issuer_key() != group_key.public_bytes():
+    if certificate_chain.get(0).get_type() == BCertCertType.DEVICE:
+        raise InvalidCertificateChain("Device has already been provisioned")
+
+    if certificate_chain.get(0).get_type() != BCertCertType.ISSUER:
+        raise InvalidCertificateChain("Leaf-most certificate must be of type ISSUER to issue certificate of type DEVICE")
+
+    if not certificate_chain.get(0).contains_public_key(group_key):
         raise InvalidCertificateChain("Group key does not match this certificate")
+
+    certificate_chain.verify_chain(
+        check_expiry=True,
+        cert_type=BCertCertType.ISSUER
+    )
+
+    encryption_key = ECCKey.load(encryption_key) if encryption_key else ECCKey.generate()
+    signing_key = ECCKey.load(signing_key) if signing_key else ECCKey.generate()
 
     new_certificate = Certificate.new_leaf_cert(
         cert_id=get_random_bytes(16),
@@ -168,7 +201,10 @@ def create_device(
     )
     certificate_chain.prepend(new_certificate)
 
-    certificate_chain.verify()
+    certificate_chain.verify_chain(
+        check_expiry=True,
+        cert_type=BCertCertType.DEVICE
+    )
 
     device = Device(
         group_key=group_key.dumps(),
@@ -202,9 +238,82 @@ def create_device(
 
 
 @main.command()
+@click.option("-e", "--encryption_key", type=Path, required=True, help="Optional Device ECC private encryption key (zprivencr.dat)")
+@click.option("-s", "--signing_key", type=Path, required=True, help="Optional Device ECC private signing key (zprivsig.dat)")
+@click.option("-c", "--group_certificate", type=Path, required=True, help="Provisioned device group certificate chain")
+@click.option("-o", "--output", type=Path, default=None, help="Output Path or Directory")
+@click.pass_context
+def build_device(
+    ctx: click.Context,
+    encryption_key: Optional[Path],
+    signing_key: Optional[Path],
+    group_certificate: Path,
+    output: Optional[Path] = None
+) -> None:
+    """
+    Build a V2 Playready Device (.prd) file from encryption/signing ECC private keys and a group certificate chain.
+    Your group certificate chain's leaf certificate must be of type DEVICE (be already provisioned) for this to work.
+    """
+    if not encryption_key.is_file():
+        raise click.UsageError("encryption_key: Not a path to a file, or it doesn't exist.", ctx)
+    if not signing_key.is_file():
+        raise click.UsageError("signing_key: Not a path to a file, or it doesn't exist.", ctx)
+    if not group_certificate.is_file():
+        raise click.UsageError("group_certificate: Not a path to a file, or it doesn't exist.", ctx)
+
+    log = logging.getLogger("build-device")
+
+    encryption_key = ECCKey.load(encryption_key)
+    signing_key = ECCKey.load(signing_key)
+
+    certificate_chain = CertificateChain.load(group_certificate)
+    leaf_certificate = certificate_chain.get(0)
+
+    if not leaf_certificate.contains_public_key(encryption_key.public_bytes()):
+        raise InvalidCertificateChain("Leaf certificate does not contain encryption public key")
+
+    if not leaf_certificate.contains_public_key(signing_key.public_bytes()):
+        raise InvalidCertificateChain("Leaf certificate does not contain signing public key")
+
+    certificate_chain.verify_chain(
+        check_expiry=True,
+        cert_type=BCertCertType.DEVICE
+    )
+
+    device = Device(
+        group_key=None,
+        encryption_key=encryption_key.dumps(),
+        signing_key=signing_key.dumps(),
+        group_certificate=certificate_chain.dumps(),
+    )
+
+    if output and output.suffix:
+        if output.suffix.lower() != ".prd":
+            log.warning(f"Saving PRD with the file extension '{output.suffix}' but '.prd' is recommended.")
+        out_path = output
+    else:
+        out_dir = output or Path.cwd()
+        out_path = out_dir / f"{device.get_name()}.prd"
+
+    if out_path.exists():
+        log.error(f"A file already exists at the path '{out_path}', cannot overwrite.")
+        return
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(device.dumps(version=2))
+
+    log.info("Built Playready Device (.prd) file, %s", out_path.name)
+    log.info(" + Security Level: %s", device.security_level)
+    log.info(" + Encryption Key: %s bytes", len(device.encryption_key.dumps()))
+    log.info(" + Signing Key: %s bytes", len(device.signing_key.dumps()))
+    log.info(" + Group Certificate: %s bytes", len(device.group_certificate.dumps()))
+    log.info(" + Saved to: %s", out_path.absolute())
+
+
+@main.command()
 @click.argument("prd_path", type=Path)
-@click.option("-e", "--encryption_key", type=Path, required=False, help="Optional Device ECC private encryption key")
-@click.option("-s", "--signing_key", type=Path, required=False, help="Optional Device ECC private signing key")
+@click.option("-e", "--encryption_key", type=Path, help="Optional Device ECC private encryption key")
+@click.option("-s", "--signing_key", type=Path, help="Optional Device ECC private signing key")
 @click.option("-o", "--output", type=Path, default=None, help="Output Path or Directory")
 @click.pass_context
 def reprovision_device(
@@ -231,6 +340,9 @@ def reprovision_device(
     if device.group_key is None:
         raise OutdatedDevice("Device does not support reprovisioning, re-create it or use a Device with a version of 3 or higher")
 
+    if device.group_certificate.get(0).get_type() != BCertCertType.DEVICE:
+        raise InvalidCertificateChain("Device is not provisioned")
+
     device.group_certificate.remove(0)
 
     encryption_key = ECCKey.load(encryption_key) if encryption_key else ECCKey.generate()
@@ -250,6 +362,11 @@ def reprovision_device(
     )
     device.group_certificate.prepend(new_certificate)
 
+    device.group_certificate.verify_chain(
+        check_expiry=True,
+        cert_type=BCertCertType.DEVICE
+    )
+
     if output and output.suffix:
         if output.suffix.lower() != ".prd":
             log.warning(f"Saving PRD with the file extension '{output.suffix}' but '.prd' is recommended.")
@@ -261,6 +378,78 @@ def reprovision_device(
     out_path.write_bytes(device.dumps())
 
     log.info("Reprovisioned Playready Device (.prd) file, %s", out_path.name)
+
+@main.command()
+@click.option("-d", "--device", type=Path, default=None, help="PRD Device")
+@click.option("-c", "--chain", type=Path, default=None, help="BCert Chain (bgroupcert.dat, bdevcert.dat)")
+@click.pass_context
+def inspect(ctx: click.Context, device: Optional[Path], chain: Optional[Path]) -> None:
+    """
+    Inspect a (device's) Certificate Chain to display information about each of its Certificates.
+    """
+    if bool(device) == bool(chain):
+        raise click.UsageError("You must provide exactly one of device or chain.", ctx)
+
+    if device:
+        if not device.is_file():
+            raise click.UsageError("device: Not a path to a file, or it doesn't exist.", ctx)
+
+        device = Device.load(device)
+        chai = device.group_certificate
+    elif chain:
+        if not chain.is_file():
+            raise click.UsageError("chain: Not a path to a file, or it doesn't exist.", ctx)
+
+        chai = CertificateChain.load(chain)
+    else:
+        return None  # suppress warning
+
+    log = logging.getLogger("inspect")
+    log.info("Certificate Chain Inspection:")
+
+    log.info(f" + Version: {chai.parsed.version}")
+    log.info(f" + Certificate Count: {chai.parsed.certificate_count}")
+
+    for i in range(chai.count()):
+        cert = chai.get(i)
+
+        log.info(f"   + Certificate {i}:")
+
+        basic_info = cert.get_attribute(BCertObjType.BASIC)
+        if basic_info:
+            log.info(f"     + Cert Type: {BCertCertType(basic_info.attribute.cert_type).name}")
+            log.info(f"     + Security Level: SL{basic_info.attribute.security_level}")
+            log.info(f"     + Expiration Date: {datetime.fromtimestamp(basic_info.attribute.expiration_date)}")
+            log.info(f"     + Client ID: {basic_info.attribute.client_id.hex()}")
+
+        model_name = cert.get_name()
+        if model_name:
+            log.info( f"     + Name: {model_name}")
+
+        feature_info = cert.get_attribute(BCertObjType.FEATURE)
+        if feature_info and feature_info.attribute.feature_count > 0:
+            features = list(map(
+                lambda x: BCertFeatures(x).name,
+                feature_info.attribute.features
+            ))
+            log.info(f"     + Features: {', '.join(features)}")
+
+        key_info = cert.get_attribute(BCertObjType.KEY)
+        if key_info and key_info.attribute.key_count > 0:
+            key_attr = key_info.attribute
+            log.info(f"     + Cert Keys:")
+            for idx, key in enumerate(key_attr.cert_keys):
+                log.info(f"       + Key {idx}:")
+                log.info(f"         + Type: {BCertKeyType(key.type).name}")
+                log.info(f"         + Key Length: {key.length} bits")
+                usages = list(map(
+                    lambda x: BCertKeyUsage(x).name,
+                    key.usages
+                ))
+                if len(usages) > 0:
+                    log.info(f"         + Usages: {', '.join(usages)}")
+
+    return None
 
 
 @main.command()

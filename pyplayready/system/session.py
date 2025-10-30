@@ -15,6 +15,3 @@ class Session:
         self.signing_key: Optional[ECCKey] = None
         self.encryption_key: Optional[ECCKey] = None
         self.keys: list[Key] = []
-
-
-__all__ = ("Session",)

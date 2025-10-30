@@ -31,6 +31,7 @@ An example code snippet:
 from pyplayready.cdm import Cdm
 from pyplayready.device import Device
 from pyplayready.system.pssh import PSSH
+from pyplayready.misc.revocation_list import RevocationList
 
 import requests
 
@@ -52,7 +53,7 @@ pssh = PSSH(
     "AFQATwBNAEEAVABUAFIASQBCAFUAVABFAFMAPgA8AC8ARABBAFQAQQA+ADwALwBXAFIATQBIAEUAQQBEAEUAUgA+AA=="
 )
 
-request = cdm.get_license_challenge(session_id, pssh.wrm_headers[0])
+request = cdm.get_license_challenge(session_id, pssh.wrm_headers[0], rev_lists=RevocationList.SupportedListIds)
 
 response = requests.post(
     url="https://test.playready.microsoft.com/service/rightsmanager.asmx?cfg=(persist:false,sl:2000)",

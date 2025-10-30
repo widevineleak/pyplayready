@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import Any, Optional, Union
+from uuid import UUID
 
 from aiohttp.typedefs import Handler
 from aiohttp import web
@@ -8,7 +9,7 @@ from pyplayready import __version__, PSSH
 from pyplayready.cdm import Cdm
 from pyplayready.device import Device
 
-from pyplayready.exceptions import (InvalidSession, TooManySessions, InvalidLicense, InvalidPssh)
+from pyplayready.misc.exceptions import (InvalidSession, TooManySessions, InvalidXmrLicense, InvalidPssh)
 
 routes = web.RouteTableDef()
 
@@ -103,6 +104,7 @@ async def get_license_challenge(request: web.Request) -> web.Response:
 
     session_id = bytes.fromhex(body["session_id"])
     init_data = body["init_data"]
+    rev_lists = body.get("rev_lists")
 
     if not init_data.startswith("<WRMHEADER"):
         try:
@@ -116,6 +118,7 @@ async def get_license_challenge(request: web.Request) -> web.Response:
         license_request = cdm.get_license_challenge(
             session_id=session_id,
             wrm_header=init_data,
+            rev_lists=list(map(UUID, rev_lists)) if rev_lists else None
         )
     except InvalidSession:
         return web.json_response({"message": f"Invalid Session ID '{session_id.hex()}', it may have expired."}, status=400)
@@ -151,7 +154,7 @@ async def parse_license(request: web.Request) -> web.Response:
         cdm.parse_license(session_id, license_message)
     except InvalidSession:
         return web.json_response({"message": f"Invalid Session ID '{session_id.hex()}', it may have expired."}, status=400)
-    except InvalidLicense as e:
+    except InvalidXmrLicense as e:
         return web.json_response({"message": f"Invalid License, {e}"}, status=400)
     except Exception as e:
         return web.json_response({"message": f"Error, {e}"}, status=500)

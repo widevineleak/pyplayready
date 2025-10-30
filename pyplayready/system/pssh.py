@@ -5,12 +5,12 @@ from uuid import UUID
 from construct import Struct, Int32ul, Int16ul, this, Bytes, Switch, Int8ub, Int24ub, Int32ub, Const, Container, \
     ConstructError, Rebuild, Default, If, PrefixedArray, Prefixed, GreedyBytes
 
-from pyplayready.exceptions import InvalidPssh
+from pyplayready.misc.exceptions import InvalidPssh
 from pyplayready.system.wrmheader import WRMHeader
 
 
 class _PlayreadyPSSHStructs:
-    PSSHBox = Struct(
+    PsshBox = Struct(
         "length" / Int32ub,
         "pssh" / Const(b"pssh"),
         "version" / Rebuild(Int8ub, lambda ctx: 1 if (hasattr(ctx, "key_ids") and ctx.key_ids) else 0),
@@ -58,7 +58,7 @@ class PSSH(_PlayreadyPSSHStructs):
         self.wrm_headers: List[WRMHeader]
         try:
             # PSSH Box -> PlayReady Header
-            box = self.PSSHBox.parse(data)
+            box = self.PsshBox.parse(data)
             if self._is_utf_16_le(box.data):
                 self.wrm_headers = [WRMHeader(box.data)]
             else:

@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import base64
 from enum import IntEnum
-from typing import Union
+from typing import Union, Tuple
+from uuid import UUID
 
 from Crypto.Cipher import AES
 from Crypto.Hash import CMAC
+from Crypto.Util.strxor import strxor
 from construct import Const, GreedyRange, Struct, Int32ub, Bytes, Int16ub, this, Switch, LazyBound, Array, Container
+
+from pyplayready import ECCKey, Crypto
+from pyplayready.license.key import Key
+from pyplayready.misc.exceptions import InvalidXmrLicense
 
 
 class XMRObjectTypes(IntEnum):
@@ -300,6 +306,11 @@ class _XMRLicenseStructs:
 class XMRLicense(_XMRLicenseStructs):
     """Represents an XMRLicense"""
 
+    MagicConstantZero = bytes([
+        0x7e, 0xe9, 0xed, 0x4a, 0xf7, 0x73, 0x22, 0x4f,
+        0x00, 0xb8, 0xea, 0x7e, 0xfb, 0x02, 0x7c, 0xbb
+    ])
+
     def __init__(
             self,
             parsed_license: Container,
@@ -336,8 +347,64 @@ class XMRLicense(_XMRLicenseStructs):
             if container.type == type_:
                 yield container.data
 
-    def get_content_keys(self):
-        yield from self.get_object(XMRObjectTypes.CONTENT_KEY_OBJECT)
+    def get_device_key_obj(self) -> Container:
+        return next(self.get_object(XMRObjectTypes.ECC_DEVICE_KEY_OBJECT), None)
+
+    def get_content_key_obj(self) -> Container:
+        return next(self.get_object(XMRObjectTypes.CONTENT_KEY_OBJECT), None)
+
+    def is_scalable(self) -> bool:
+        return bool(next(self.get_object(XMRObjectTypes.AUX_KEY_OBJECT), None))
+
+    def get_content_key(self, encryption_key: ECCKey) -> Key:
+        ecc_key = self.get_device_key_obj()
+        if ecc_key is None:
+            raise InvalidXmrLicense("No ECC public key in license")
+
+        if ecc_key.key != encryption_key.public_bytes():
+            raise InvalidXmrLicense("Public encryption key does not match")
+
+        content_key = self.get_content_key_obj()
+        cipher_type = Key.CipherType(content_key.cipher_type)
+
+        if cipher_type not in (Key.CipherType.ECC_256, Key.CipherType.ECC_256_WITH_KZ, Key.CipherType.ECC_256_VIA_SYMMETRIC):
+            raise InvalidXmrLicense(f"Invalid cipher type {cipher_type}")
+
+        via_symmetric = Key.CipherType(content_key.cipher_type) == Key.CipherType.ECC_256_VIA_SYMMETRIC
+
+        decrypted = Crypto.ecc256_decrypt(encryption_key, content_key.encrypted_key)
+        ci, ck = decrypted[:16], decrypted[16:]
+
+        if self.is_scalable():
+            ci, ck = decrypted[::2][:16], decrypted[1::2][:16]
+
+            if via_symmetric:
+                embedded_root_license = content_key.encrypted_key[:144]
+                embedded_leaf_license = content_key.encrypted_key[144:]
+
+                rgb_key = strxor(ck, self.MagicConstantZero)
+                content_key_prime = AES.new(ck, AES.MODE_ECB).encrypt(rgb_key)
+
+                aux_key = next(self.get_object(XMRObjectTypes.AUX_KEY_OBJECT))["auxiliary_keys"][0]["key"]
+
+                uplink_x_key = AES.new(content_key_prime, AES.MODE_ECB).encrypt(aux_key)
+                secondary_key = AES.new(ck, AES.MODE_ECB).encrypt(embedded_root_license[128:])
+
+                embedded_leaf_license = AES.new(uplink_x_key, AES.MODE_ECB).encrypt(embedded_leaf_license)
+                embedded_leaf_license = AES.new(secondary_key, AES.MODE_ECB).encrypt(embedded_leaf_license)
+
+                ci, ck = embedded_leaf_license[:16], embedded_leaf_license[16:]
+
+        if not self.check_signature(ci):
+            raise InvalidXmrLicense("License integrity signature does not match")
+
+        return Key(
+            key_id=UUID(bytes_le=content_key.key_id),
+            key_type=content_key.key_type,
+            cipher_type=content_key.cipher_type,
+            key_length=content_key.key_length,
+            key=ck
+        )
 
     def check_signature(self, integrity_key: bytes) -> bool:
         cmac = CMAC.new(integrity_key, ciphermod=AES)

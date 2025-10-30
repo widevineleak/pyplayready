@@ -5,10 +5,10 @@ from enum import IntEnum
 from pathlib import Path
 from typing import Union, Any, Optional
 
-from pyplayready.device.structs import DeviceStructs
-from pyplayready.exceptions import OutdatedDevice
-from pyplayready.system.bcert import CertificateChain
 from pyplayready.crypto.ecc_key import ECCKey
+from pyplayready.device.structs import DeviceStructs
+from pyplayready.misc.exceptions import OutdatedDevice
+from pyplayready.system.bcert import CertificateChain
 
 
 class Device:
@@ -73,13 +73,13 @@ class Device:
         with Path(path).open(mode="rb") as f:
             return cls.loads(f.read())
 
-    def dumps(self) -> bytes:
-        if not self.group_key:
-            raise OutdatedDevice("Cannot dump a v2 device, re-create it or use a Device with a version of 3 or higher")
+    def dumps(self, version: int = CURRENT_VERSION) -> bytes:
+        if self.group_key is None and version == self.CURRENT_VERSION:
+            raise OutdatedDevice("Cannot dump device as version 3 without having a group key. Either provide a group key or set argument version=2")
 
         return DeviceStructs.prd.build(dict(
-            version=self.CURRENT_VERSION,
-            group_key=self.group_key.dumps(),
+            version=version,
+            group_key=self.group_key.dumps() if self.group_key else None,
             encryption_key=self.encryption_key.dumps(),
             signing_key=self.signing_key.dumps(),
             group_certificate_length=len(self.group_certificate.dumps()),
